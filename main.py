@@ -4,6 +4,7 @@ import sys
 import numpy as np
 import cv2
 from crypto.hybrid import HybridCrypto
+from crypto.lightweight import LightweightCrypto
 from steganography.dwt import DWTSteganography
 from crypto.rsa import RSACipher
 from cryptography.hazmat.primitives import serialization
@@ -37,7 +38,7 @@ def parse_arguments():
         "-o", "--output", required=True, help="Path to save the output stego image"
     )
     encrypt_parser.add_argument(
-        "-k", "--key", required=True, help="Path to the RSA public key file (.pem)"
+        "-k", "--key", required=True, help="Path to the RSA/ECC public key file (.pem)"
     )
     encrypt_parser.add_argument(
         "-a",
@@ -45,6 +46,13 @@ def parse_arguments():
         type=float,
         default=0.1,
         help="Embedding strength factor (default: 0.1, range: 0.05-0.2)",
+    )
+    encrypt_parser.add_argument(
+        "-c",
+        "--crypto",
+        choices=["classic", "lightweight"],
+        default="classic",
+        help="Cryptography mode: classic (RSA+AES) or lightweight (ECC+ChaCha20)",
     )
 
     # Decrypt command
@@ -78,10 +86,10 @@ def parse_arguments():
     # Generate keys command
     keys_parser = subparsers.add_parser(
         "genkeys",
-        help="Generate RSA key pair",
-        description="Generates a new RSA public/private key pair for encryption and decryption",
+        help="Generate key pair (RSA or ECC)",
+        description="Generates a new key pair for encryption and decryption",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="Example: python main.py genkeys -o keys -s 2048",
+        epilog="Example: python main.py genkeys -o keys -s 2048 -c classic",
     )
     keys_parser.add_argument(
         "-o",
@@ -90,20 +98,30 @@ def parse_arguments():
         help="Directory path to save the generated keys",
     )
     keys_parser.add_argument(
+        "-c",
+        "--crypto",
+        choices=["classic", "lightweight"],
+        default="classic",
+        help="Cryptography mode: classic (RSA) or lightweight (ECC)",
+    )
+    keys_parser.add_argument(
         "-s",
         "--size",
         type=int,
         default=2048,
-        choices=[1024, 2048, 3072, 4096],
-        help="Key size in bits (default: 2048, options: 1024, 2048, 3072, 4096)",
+        help="Key size in bits (RSA: 1024-4096, ECC: 256/384/521)",
     )
 
     return parser.parse_args()
 
 
-# Update the encrypt_and_hide function
 def encrypt_and_hide(
-    message_file, cover_image_file, output_file, public_key_file, alpha=0.1
+    message_file,
+    cover_image_file,
+    output_file,
+    public_key_file,
+    alpha=0.1,
+    crypto_mode="classic",
 ):
     """Encrypt a message and hide it in an image."""
     # Read message
@@ -119,16 +137,25 @@ def encrypt_and_hide(
     # Convert BGR to RGB
     cover_image = cv2.cvtColor(cover_image, cv2.COLOR_BGR2RGB)
 
+    # Select crypto implementation based on mode
+    if crypto_mode == "classic":
+        from crypto.hybrid import HybridCrypto
+
+        crypto = HybridCrypto()
+    else:  # lightweight
+        from crypto.lightweight import LightweightCrypto
+
+        crypto = LightweightCrypto()
+
     # Encrypt message
-    crypto = HybridCrypto()
-    encrypted_data, encrypted_key = crypto.encrypt(message, public_key_file)
+    encrypted_data, key_material = crypto.encrypt(message, public_key_file)
 
-    # Combine encrypted data and key for embedding
-    # First 4 bytes: length of encrypted key
-    key_length = len(encrypted_key).to_bytes(4, byteorder="big")
-    combined_data = key_length + encrypted_key + encrypted_data
+    # Combine key material and encrypted data for embedding
+    # First 4 bytes: length of key material
+    key_length = len(key_material).to_bytes(4, byteorder="big")
+    combined_data = key_length + key_material + encrypted_data
 
-    print(f"Key length: {len(encrypted_key)} bytes")
+    print(f"Key material length: {len(key_material)} bytes")
     print(f"Data length: {len(encrypted_data)} bytes")
     print(f"Combined data length: {len(combined_data)} bytes")
 
@@ -206,8 +233,12 @@ def extract_and_decrypt(stego_image_file, output_file, private_key_file, alpha=0
     print(f"Encrypted key size: {len(encrypted_key)} bytes")
     print(f"Encrypted data size: {len(encrypted_data)} bytes")
 
-    # Decrypt data
-    crypto = HybridCrypto()
+    # Choose crypto based on key size
+    if len(encrypted_key) > 256:  # RSA keys are typically larger
+        crypto = HybridCrypto()
+    else:  # Shorter keys are likely from ECC
+        crypto = LightweightCrypto()
+
     try:
         decrypted_data = crypto.decrypt(encrypted_data, encrypted_key, private_key_file)
         print(f"Decrypted data size: {len(decrypted_data)} bytes")
@@ -224,22 +255,42 @@ def extract_and_decrypt(stego_image_file, output_file, private_key_file, alpha=0
     )
 
 
-def generate_keys(output_dir, key_size=2048):
-    """Generate RSA key pair."""
+def generate_keys(output_dir, key_size=2048, crypto_mode="classic"):
+    """Generate key pair based on selected cryptography mode."""
     # Create output directory if it doesn't exist
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    # Generate keys
-    rsa = RSACipher()
-    private_key, public_key = rsa.generate_key_pair(key_size)
-
-    # Save keys
     private_path = os.path.join(output_dir, "private_key.pem")
     public_path = os.path.join(output_dir, "public_key.pem")
-    rsa.save_keys(private_key, public_key, private_path, public_path)
 
-    print(f"RSA key pair generated.")
+    if crypto_mode == "classic":
+        # Validate RSA key size
+        if key_size < 1024 or key_size > 4096:
+            print("Error: RSA key size must be between 1024 and 4096 bits")
+            sys.exit(1)
+
+        # Generate RSA keys
+        rsa = RSACipher()
+        private_key, public_key = rsa.generate_key_pair(key_size)
+        rsa.save_keys(private_key, public_key, private_path, public_path)
+        print(f"RSA key pair generated ({key_size} bits)")
+
+    else:  # lightweight mode
+        # Validate ECC key size
+        valid_ecc_sizes = [256, 384, 521]
+        if key_size not in valid_ecc_sizes:
+            print(f"Error: ECC key size must be one of {valid_ecc_sizes}")
+            sys.exit(1)
+
+        # Generate ECC keys
+        from crypto.ecc import ECCCipher
+
+        ecc = ECCCipher()
+        private_key, public_key = ecc.generate_key_pair()
+        ecc.save_keys(private_key, public_key, private_path, public_path)
+        print(f"ECC key pair generated (SECP{key_size}K1)")
+
     print(f"Private key saved to {private_path}")
     print(f"Public key saved to {public_path}")
 
@@ -249,13 +300,15 @@ def main():
     args = parse_arguments()
 
     if args.command == "encrypt":
-        encrypt_and_hide(args.message, args.image, args.output, args.key, args.alpha)
+        encrypt_and_hide(
+            args.message, args.image, args.output, args.key, args.alpha, args.crypto
+        )
 
     elif args.command == "decrypt":
         extract_and_decrypt(args.image, args.output, args.key, args.alpha)
 
     elif args.command == "genkeys":
-        generate_keys(args.output, args.size)
+        generate_keys(args.output, args.size, args.crypto)
 
     else:
         print("Please specify a command. Use -h for help.")
